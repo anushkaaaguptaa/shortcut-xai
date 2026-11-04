@@ -51,7 +51,7 @@ class ExplanationEngine:
             attr, _ = self.integrated_gradients.attribute(
                 input_tensor,
                 target=target_class,
-                n_steps=kwargs.get('n_steps', 25),
+                n_steps=kwargs.get('n_steps', 50),
                 return_convergence_delta=True
             )
             # Sum absolute attribution across the 3 color channels -> [B, H, W]

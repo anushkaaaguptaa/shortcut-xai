@@ -33,20 +33,37 @@ shortcut-xai/
 
 ## 🚀 Quick Start
 
-### 1. Run Pipeline Unit Tests
+### 0. Install dependencies
 ```bash
-python3 -m unittest tests/test_pipeline.py
+pip install -r requirements.txt
 ```
 
-### 2. Run a Quick Test (Bias rho = 0.0 vs 1.0)
+### 1. Run Pipeline Unit Tests (no torch-free parts need data)
 ```bash
-python3 run_experiments.py --quick_test --epochs 3 --samples 20
+python -m unittest tests.test_pipeline
 ```
 
-### 3. Run the Full Controlled 4-Level Bias Sweep (rho = 0.0, 0.7, 0.9, 1.0)
+### 2. Smoke test (rho = 0.0 vs 1.0, 1 seed, 10 images)
 ```bash
-python3 run_experiments.py --epochs 5 --samples 50
+python run_experiments.py --quick_test
 ```
+
+### 3. Full controlled sweep (default: rho ∈ {0.0, 0.7, 0.9, 1.0} × seeds {0,1,2} = 12 models)
+```bash
+python run_experiments.py --epochs 10
+```
+
+### CPU-only / reduced run
+```bash
+python run_experiments.py --rhos 0.0,0.9,1.0 --seeds 0,1 --arch smallcnn --samples 50
+```
+
+The architecture auto-selects by hardware: **SmallCNN** on CPU (no download, trains in minutes),
+**ResNet-18** (ImageNet-pretrained) on GPU/MPS. Override with `--arch`.
+
+**Outputs:** `results/per_model_metrics.csv` (one row per model), `results/summary_by_rho.csv`
+(mean±std across seeds), and `results/figures/` (localization-vs-ρ curves, AFR-vs-AM* scatter,
+qualitative heatmap panels). Checkpoints + per-run configs land in `checkpoints/`.
 
 ---
 

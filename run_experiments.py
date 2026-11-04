@@ -1,147 +1,189 @@
 import os
+import json
 import argparse
-import torch
-import pandas as pd
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 
 from src.dataset import ShortcutDataset
-from src.model import build_model
-from src.train import train_model, get_device
+from src.train import train_model, get_device, set_seed, checkpoint_name
+from src.model import auto_arch
 from src.evaluate import evaluate_behavior, load_trained_model
 from src.explain import ExplanationEngine
-from src.metrics import compute_attribution_mass, compute_pointing_game_hit, compute_faithfulness_correlation
-from src.visualize import plot_attribution_comparison, plot_sensitivity_curve
+from src.metrics import compute_am_above_chance, random_box_null, compute_pointing_game_hit
+from src.visualize import plot_attribution_comparison, plot_sensitivity_curve, plot_faithfulness_scatter
+
+import torch
+
+METHODS = ['gradcam', 'integrated_gradients', 'occlusion']
 
 
-def run_xai_benchmark(
-    bias_levels=[0.0, 0.7, 0.9, 1.0],
-    epochs=3,
-    sample_eval_limit=50,
-    output_dir="./results",
-    data_dir="./data"
-):
+def attribute_on_conflict(ckpt_path, device, marker_size, target_size, seed,
+                          sample_limit, fig_dir, rho):
+    """
+    Run the three attribution methods on the CONFLICT set (marker stamped on normal images),
+    explaining the model's PREDICTED class. Returns per-method aggregates.
+    """
+    model, _ = load_trained_model(ckpt_path, device)
+    explainer = ExplanationEngine(model, device=device)
+    ds = ShortcutDataset(split='test', mode='test_discordant', marker_size=marker_size,
+                         target_size=target_size, seed=seed, data_dir='./data')
+
+    eval_idx = [i for i, f in enumerate(ds.shortcut_flags) if f][:sample_limit]
+    rng = np.random.RandomState(seed)
+    agg = {m: {'amstar': [], 'am': [], 'hit': [], 'nullbeat': []} for m in METHODS}
+    n_fig = 0
+
+    occ_win = marker_size
+    occ_stride = max(1, marker_size // 2)
+
+    for i, idx in enumerate(tqdm(eval_idx, desc=f"  attribute rho={rho:.2f} seed={seed}", leave=False)):
+        sample = ds[idx]
+        img, bbox = sample['image'], sample['bbox'].numpy()
+        with torch.no_grad():
+            pred = int(model(img.unsqueeze(0).to(device)).argmax(dim=1).item())
+
+        heatmaps = {}
+        for m in METHODS:
+            hm = explainer.attribute(img, target_class=pred, method=m,
+                                     n_steps=50, window_size=occ_win, stride=occ_stride)
+            heatmaps[m] = hm
+            am, _chance, amstar, _ratio = compute_am_above_chance(hm, bbox)
+            _null_mean, null_p95 = random_box_null(hm, (marker_size, marker_size),
+                                                   n_samples=500, rng=rng, pct=95.0)
+            agg[m]['am'].append(am)
+            agg[m]['amstar'].append(amstar)
+            agg[m]['hit'].append(compute_pointing_game_hit(hm, bbox))
+            agg[m]['nullbeat'].append(1.0 if am > null_p95 else 0.0)
+
+        if n_fig < 2:
+            plot_attribution_comparison(
+                img, bbox, heatmaps,
+                title=f"Conflict set (rho={rho:.2f}, seed={seed}, pred={pred})",
+                save_path=os.path.join(fig_dir, f"sample_rho{rho:.2f}_seed{seed}_{idx}.png"))
+            n_fig += 1
+
+    out = {}
+    for m in METHODS:
+        out[f'am_{m}'] = float(np.mean(agg[m]['am'])) if agg[m]['am'] else 0.0
+        out[f'amstar_{m}'] = float(np.mean(agg[m]['amstar'])) if agg[m]['amstar'] else 0.0
+        out[f'hit_{m}'] = float(np.mean(agg[m]['hit'])) if agg[m]['hit'] else 0.0
+        out[f'nullbeat_{m}'] = float(np.mean(agg[m]['nullbeat'])) if agg[m]['nullbeat'] else 0.0
+    return out
+
+
+def run_benchmark(rhos, seeds, epochs, arch, marker_size, target_size,
+                  sample_limit, afr_threshold, output_dir, data_dir, val_clean=False):
     os.makedirs(output_dir, exist_ok=True)
     fig_dir = os.path.join(output_dir, "figures")
     os.makedirs(fig_dir, exist_ok=True)
-
     device = get_device()
-    print(f"================================================================")
-    print(f"🚀 Starting Shortcut Learning Explainability Benchmark on {device}")
-    print(f"   Bias sweep: {bias_levels}")
-    print(f"================================================================")
+    if arch is None:
+        arch = auto_arch(device)
 
-    summary_records = []
+    print("=" * 70)
+    print(f"Dose-response shortcut-XAI benchmark | device={device} arch={arch}")
+    print(f"rhos={rhos}  seeds={seeds}  epochs={epochs}  marker={marker_size}px@{target_size}")
+    print("=" * 70)
 
-    for rho in bias_levels:
-        ckpt_path = os.path.join("./checkpoints", f"model_bias_{rho:.2f}.pt")
+    rows = []
+    for rho in rhos:
+        for seed in seeds:
+            set_seed(seed)
+            ckpt = os.path.join("./checkpoints", checkpoint_name(rho, seed, arch))
+            if not os.path.exists(ckpt):
+                train_model(bias_prob=rho, seed=seed, arch=arch, epochs=epochs,
+                            marker_size=marker_size, target_size=target_size,
+                            val_clean=val_clean, output_dir="./checkpoints", data_dir=data_dir)
+            else:
+                print(f"[+] Found checkpoint {ckpt}")
 
-        # Step 1: Train model if not already cached
-        if not os.path.exists(ckpt_path):
-            print(f"\n--- [1/4] Training Model with rho={rho:.2f} ---")
-            train_model(bias_prob=rho, epochs=epochs, output_dir="./checkpoints", data_dir=data_dir)
-        else:
-            print(f"\n[+] Found existing checkpoint: {ckpt_path}")
+            behavior = evaluate_behavior(ckpt, data_dir=data_dir)
+            attr = attribute_on_conflict(ckpt, device, marker_size, target_size, seed,
+                                         sample_limit, fig_dir, rho)
 
-        # Step 2: Behavioral evaluation
-        print(f"--- [2/4] Evaluating Behavioral Shortcut Reliance for rho={rho:.2f} ---")
-        behavior = evaluate_behavior(ckpt_path, data_dir=data_dir)
+            row = {'bias_prob': rho, 'seed': seed,
+                   'acc_clean': behavior['acc_clean'],
+                   'acc_concordant': behavior['acc_concordant'],
+                   'drop_rate': behavior['drop_rate'],
+                   'adversarial_flip_rate': behavior['adversarial_flip_rate'],
+                   **attr}
+            # Detection rule: localization beats the random-box null for a majority of images
+            # AND the model is behaviorally reliant on the marker.
+            reliant = behavior['adversarial_flip_rate'] > afr_threshold
+            for m in METHODS:
+                row[f'detected_{m}'] = bool(row[f'nullbeat_{m}'] > 0.5 and reliant)
+            rows.append(row)
 
-        # Step 3: Explainability attribution
-        print(f"--- [3/4] Extracting XAI Attributions (Grad-CAM, IG, Occlusion) ---")
-        model, _ = load_trained_model(ckpt_path, device)
-        explainer = ExplanationEngine(model, device=device)
+            print(f"    behaviorally reliant: {reliant} (AFR {behavior['adversarial_flip_rate']*100:.1f}%)")
+            for m in METHODS:
+                print(f"    {m:<20} AM* {row[f'amstar_{m}']*100:+6.2f}%  "
+                      f"hit {row[f'hit_{m}']*100:5.1f}%  null-beat {row[f'nullbeat_{m}']*100:5.1f}%  "
+                      f"=> detected={row[f'detected_{m}']}")
 
-        # Evaluate on test set with concordant shortcuts to test localization of the marker
-        test_dataset = ShortcutDataset(split='test', mode='test_concordant', data_dir=data_dir)
-        
-        # Test clean set to measure logit drops when marker is removed
-        test_clean_dataset = ShortcutDataset(split='test', mode='test_clean', data_dir=data_dir)
+    per_model = pd.DataFrame(rows)
+    per_model_path = os.path.join(output_dir, "per_model_metrics.csv")
+    per_model.to_csv(per_model_path, index=False)
+    print(f"\n[+] Saved per-model metrics: {per_model_path}")
 
-        am_records = {'gradcam': [], 'integrated_gradients': [], 'occlusion': []}
-        hit_records = {'gradcam': [], 'integrated_gradients': [], 'occlusion': []}
-        logit_drops = []
+    # Aggregate across seeds for each rho.
+    metric_cols = (['acc_clean', 'drop_rate', 'adversarial_flip_rate']
+                   + [f'{p}_{m}' for p in ['am', 'amstar', 'hit', 'nullbeat'] for m in METHODS])
+    agg = per_model.groupby('bias_prob')[metric_cols].agg(['mean', 'std'])
+    agg.columns = [f"{c}_{s}" for c, s in agg.columns]
+    agg = agg.reset_index()
+    agg_path = os.path.join(output_dir, "summary_by_rho.csv")
+    agg.to_csv(agg_path, index=False)
+    print(f"[+] Saved rho-aggregated summary: {agg_path}")
 
-        eval_indices = [i for i, flag in enumerate(test_dataset.shortcut_flags) if flag][:sample_eval_limit]
+    # Figures.
+    plot_sensitivity_curve(agg, metric_prefix='amstar',
+                           ylabel="Attribution mass above chance (%)",
+                           title="Shortcut localization vs correlation strength",
+                           save_path=os.path.join(fig_dir, "amstar_vs_rho.png"))
+    plot_sensitivity_curve(agg, metric_prefix='hit',
+                           ylabel="Pointing-game hit rate (%)",
+                           title="Peak-in-marker rate vs correlation strength",
+                           save_path=os.path.join(fig_dir, "hit_vs_rho.png"))
+    plot_faithfulness_scatter(per_model, save_path=os.path.join(fig_dir, "afr_vs_amstar.png"))
 
-        for i, idx in enumerate(tqdm(eval_indices, desc=f"XAI Attribution rho={rho:.2f}")):
-            sample = test_dataset[idx]
-            img = sample['image']
-            bbox = sample['bbox'].numpy()
-            target_cls = int(sample['label'])
+    with open(os.path.join(output_dir, "run_config.json"), 'w') as f:
+        json.dump({'rhos': rhos, 'seeds': seeds, 'epochs': epochs, 'arch': arch,
+                   'marker_size': marker_size, 'target_size': target_size,
+                   'sample_limit': sample_limit, 'afr_threshold': afr_threshold}, f, indent=2)
 
-            # Behavioral shift: logit difference between image with marker vs clean
-            sample_clean = test_clean_dataset[idx]
-            with torch.no_grad():
-                out_marked = model(img.unsqueeze(0).to(device))
-                out_clean = model(sample_clean['image'].unsqueeze(0).to(device))
-                logit_drop = float((out_marked[0, target_cls] - out_clean[0, target_cls]).item())
-                logit_drops.append(logit_drop)
+    print("\n[✓] Benchmark complete. See per_model_metrics.csv and summary_by_rho.csv.")
+    return per_model, agg
 
-            heatmaps = {}
-            for method in ['gradcam', 'integrated_gradients', 'occlusion']:
-                hm = explainer.attribute(img, target_class=target_cls, method=method)
-                heatmaps[method] = hm
-                am = compute_attribution_mass(hm, bbox)
-                hit = compute_pointing_game_hit(hm, bbox)
-                am_records[method].append(am)
-                hit_records[method].append(hit)
 
-            # Save qualitative visual figure for the first 3 samples
-            if i < 3:
-                fig_path = os.path.join(fig_dir, f"sample_{idx}_rho_{rho:.2f}.png")
-                plot_attribution_comparison(
-                    img, bbox, heatmaps,
-                    title=f"Attribution Map (rho={rho:.2f}, Label={target_cls})",
-                    save_path=fig_path
-                )
+def _parse_floats(s):
+    return [float(x) for x in s.split(',')]
 
-        # Step 4: Quantitative metric compilation
-        print(f"--- [4/4] Compiling Statistics for rho={rho:.2f} ---")
-        record = {
-            'bias_prob': rho,
-            'acc_clean': behavior['acc_clean'],
-            'acc_concordant': behavior['acc_concordant'],
-            'drop_rate': behavior['drop_rate'],
-            'adversarial_flip_rate': behavior.get('adversarial_flip_rate', 0.0),
-        }
 
-        for method in ['gradcam', 'integrated_gradients', 'occlusion']:
-            mean_am = float(np.mean(am_records[method]))
-            mean_hit = float(np.mean(hit_records[method]))
-            faith = compute_faithfulness_correlation(am_records[method], logit_drops)
-
-            record[f'am_{method}'] = mean_am
-            record[f'hit_{method}'] = mean_hit
-            record[f'faith_r_{method}'] = faith['pearson_r']
-            record[f'faith_rho_{method}'] = faith['spearman_rho']
-
-            print(f"    • {method.replace('_', ' ').title():<20} "
-                  f"AM: {mean_am*100:5.2f}% | "
-                  f"Hit Rate: {mean_hit*100:5.2f}% | "
-                  f"Faithfulness (r): {faith['pearson_r']:+.3f}")
-
-        summary_records.append(record)
-
-    # Save summary dataframe
-    summary_df = pd.DataFrame(summary_records)
-    csv_path = os.path.join(output_dir, "summary_metrics.csv")
-    summary_df.to_csv(csv_path, index=False)
-    print(f"\n[+] Saved full summary table to: {csv_path}")
-
-    # Plot sensitivity curve
-    plot_sensitivity_curve(summary_df, save_path=os.path.join(fig_dir, "shortcut_sensitivity_curve.png"))
-
-    print("\n✅ Benchmark experiment complete!")
-    return summary_df
+def _parse_ints(s):
+    return [int(x) for x in s.split(',')]
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=3, help="Training epochs per model")
-    parser.add_argument("--samples", type=int, default=30, help="Number of test samples to attribute")
-    parser.add_argument("--quick_test", action="store_true", help="Run quick 2-level sweep (0.0 and 1.0)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--rhos", type=_parse_floats, default=[0.0, 0.7, 0.9, 1.0])
+    p.add_argument("--seeds", type=_parse_ints, default=[0, 1, 2])
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--arch", type=str, default=None, choices=[None, 'resnet18', 'smallcnn'])
+    p.add_argument("--marker_size", type=int, default=4)
+    p.add_argument("--target_size", type=int, default=28)
+    p.add_argument("--samples", type=int, default=100, help="attribution images per model")
+    p.add_argument("--afr_threshold", type=float, default=0.3)
+    p.add_argument("--val_clean", action="store_true",
+                   help="Select checkpoints on a CLEAN val set (default: biased, matching training)")
+    p.add_argument("--output_dir", type=str, default="./results")
+    p.add_argument("--data_dir", type=str, default="./data")
+    p.add_argument("--quick_test", action="store_true", help="2 rhos x 1 seed, few images")
+    args = p.parse_args()
 
-    bias_levels = [0.0, 1.0] if args.quick_test else [0.0, 0.7, 0.9, 1.0]
-    run_xai_benchmark(bias_levels=bias_levels, epochs=args.epochs, sample_eval_limit=args.samples)
+    if args.quick_test:
+        args.rhos, args.seeds, args.samples = [0.0, 1.0], [0], 10
+
+    run_benchmark(args.rhos, args.seeds, args.epochs, args.arch, args.marker_size,
+                  args.target_size, args.samples, args.afr_threshold,
+                  args.output_dir, args.data_dir, val_clean=args.val_clean)

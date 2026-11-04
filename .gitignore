@@ -23,3 +23,6 @@ env/
 
 # Matplotlib cache
 .matplotlib/
+
+# Generated experiment outputs (regenerate via run_experiments.py)
+results/
